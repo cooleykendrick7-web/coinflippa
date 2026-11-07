@@ -1,0 +1,15 @@
+# COINFLIPPA — Render Blueprint
+services:
+  - type: web
+    name: coinflippa
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: coinflippa-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: COINFLIPPA_DB
+        value: /data/coinflippa.db
