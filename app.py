@@ -4,14 +4,23 @@ Standalone version of the COINFLIPPA dashboard (FastAPI + SQLite), modeled on
 RUNNAUP / ClaimBoard (no-password board by Ken's standing order for his boards).
 
 WHAT IT IS:
-  - Shows Ken's REAL Coinbase account as a dated snapshot (read read-only in
-    the browser on Sat Nov 7, 2026, 4:15 PM CT). It is a SNAPSHOT, not a live
-    Coinbase feed — no live Coinbase connection exists and none is claimed.
+  - Shows Ken's REAL Coinbase account. By default that is a dated SNAPSHOT
+    (read read-only in the browser on Sat Nov 7, 2026, 4:15 PM CT) — labeled
+    as a snapshot, never passed off as live.
+  - THE WIRE (built 2026-11-08): a direct Coinbase Advanced Trade connection
+    using a CDP Secret API key kept ONLY in environment variables
+    (COINBASE_CDP_KEY_NAME / COINBASE_CDP_PRIVATE_KEY). When a key is saved,
+    the account card reads balances LIVE through the wire (labeled "Live
+    from Coinbase", cached ~60s); any wire failure falls back to the
+    snapshot with a plain note. With no key saved, nothing changes.
+  - Trading exists in code (market orders through the wire) but is GATED
+    OFF unless COINBASE_TRADING_ENABLED=true is set in the environment —
+    and nothing calls it automatically: no schedule, no page load. There
+    are no withdrawals/transfers anywhere in this code.
   - Prices ARE live: fetched server-side from the public CoinGecko API.
   - The Pot tracks money Ken puts in / takes out, flips, and profit/loss.
   - Proposals are REAL-MOVE proposals: Ken marks one done after he makes the
-    move himself in Coinbase, or skips it. This app never trades, never logs
-    into Coinbase, and never moves money.
+    move himself in Coinbase, or skips it.
 
 ENGINE RULES (in code, not just words):
   - No flip under $10 of free pot cash — fees would eat it ("nothing to flip
@@ -37,6 +46,7 @@ suggest_move() and shown on the dashboard):
   7. One move at a time, explained in plain words before Ken acts.
 """
 import os, json, time, datetime, sqlite3, urllib.request, urllib.error
+import base64, secrets, uuid
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -469,6 +479,339 @@ def suggest_move(c, prices):
     c.commit()
     return cur.lastrowid, "Move lined up the Ladder way — see the Proposals section."
 
+# ---------------- THE WIRE — direct Coinbase connection (CDP) ----------------
+# COINFLIPPA's direct wire into Ken's Coinbase: Coinbase Advanced Trade API
+# with a CDP Secret API key (ES256 JWT bearer auth). Config comes ONLY from
+# the environment:
+#   COINBASE_CDP_KEY_NAME        e.g. "organizations/{org}/apiKeys/{id}"
+#   COINBASE_CDP_PRIVATE_KEY     the PEM EC private key (escaped-\n ok)
+#   COINBASE_TRADING_ENABLED     "true" turns trading on; anything else = off
+# The key material is NEVER logged, rendered, stored in the DB, or returned
+# in any response — it only signs JWTs in memory. With no key saved, the
+# app behaves exactly as it always has (dated snapshot, zero wire calls).
+# Trading is built but GATED OFF by default, and nothing calls it
+# automatically — no schedule, no page load. No withdrawals/transfers exist
+# in this code at all: accounts read + market orders only.
+CB_HOST = "api.coinbase.com"
+CB_BASE = f"https://{CB_HOST}"
+WATCHLIST_PRODUCTS = {f"{sym}-USD" for _cid, sym, _name in COINS}
+
+try:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec_mod
+    from cryptography.hazmat.primitives import hashes as _hashes_mod
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature as _decode_dss
+    _HAS_CRYPTO = True
+except Exception:  # cryptography not installed — the wire stays dark, app still runs
+    _HAS_CRYPTO = False
+
+class WireError(Exception):
+    """A wire problem in plain words — never carries key material."""
+
+def _cb_key_name():
+    return (os.environ.get("COINBASE_CDP_KEY_NAME") or "").strip()
+
+def _cb_pem():
+    """The private key from the env, normalized: env vars on hosts like
+    Render often carry the PEM with literal backslash-n instead of newlines."""
+    p = (os.environ.get("COINBASE_CDP_PRIVATE_KEY") or "").strip()
+    if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
+        p = p[1:-1].strip()
+    return p.replace("\\n", "\n")
+
+def _cb_load_key():
+    """(key_name, private_key) or raise WireError. The key object lives in
+    memory only — never printed, stored, or sent anywhere."""
+    name, pem = _cb_key_name(), _cb_pem()
+    if not name or not pem:
+        raise WireError("No Coinbase key is saved yet.")
+    if not _HAS_CRYPTO:
+        raise WireError("The cryptography package is not installed, so the wire can't sign in.")
+    try:
+        key = load_pem_private_key(pem.encode(), password=None)
+    except Exception:
+        raise WireError("The saved Coinbase key could not be read.")
+    return name, key
+
+def coinbase_status():
+    """{"connected": bool, "reason": str} — connected only when BOTH env
+    vars are present (and the key reads). Never reveals the key or its name."""
+    if not _cb_key_name() or not (os.environ.get("COINBASE_CDP_PRIVATE_KEY") or "").strip():
+        return {"connected": False,
+                "reason": "No Coinbase key is saved yet — COINFLIPPA is showing the last snapshot."}
+    try:
+        _cb_load_key()
+    except WireError as e:
+        return {"connected": False, "reason": str(e)}
+    return {"connected": True,
+            "reason": "Coinbase key saved — COINFLIPPA can read your account live through the wire."}
+
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+def build_jwt(method, path):
+    """One short-lived ES256 JWT for a single REST call, per the CDP spec:
+    header {alg ES256, kid = key name, nonce}; claims sub = key name,
+    iss "cdp", aud ["retail_rest_api_indicator"], uri "METHOD host/path"."""
+    name, key = _cb_load_key()
+    now = int(time.time())
+    header = {"alg": "ES256", "kid": name, "typ": "JWT", "nonce": secrets.token_hex(16)}
+    claims = {"sub": name, "iss": "cdp", "nbf": now, "exp": now + 120,
+              "aud": ["retail_rest_api_indicator"],
+              "uri": f"{method.upper()} {CB_HOST}{path}"}
+    head = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{head}.{body}"
+    der = key.sign(signing_input.encode("ascii"), _ec_mod.ECDSA(_hashes_mod.SHA256()))
+    r, s = _decode_dss(der)
+    sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")  # JWS raw R||S form
+    return f"{signing_input}.{_b64url(sig)}"
+
+def _cb_http(method, url, headers, data):
+    """The wire's only raw HTTP call (urllib — same style as the price
+    feed). Tests replace this function, so tests never touch the network."""
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode()
+        except Exception:
+            return e.code, ""
+    except Exception:
+        raise WireError("Coinbase could not be reached just now.")
+
+def coinbase_request(method, path, body=None):
+    """One signed Advanced Trade call; returns Coinbase's JSON. Raises
+    WireError with a plain reason on any failure. The JWT and the key are
+    never included in errors or return values."""
+    token = build_jwt(method, path)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "User-Agent": "COINFLIPPA/1.0"}
+    data = json.dumps(body).encode() if body is not None else None
+    status, text = _cb_http(method, f"{CB_BASE}{path}", headers, data)
+    try:
+        payload = json.loads(text) if text else {}
+    except Exception:
+        payload = {}
+    if status >= 400:
+        msg = ""
+        if isinstance(payload, dict):
+            er = payload.get("error_response") or {}
+            msg = er.get("error_message") or payload.get("message") or ""
+        raise WireError(f"Coinbase said no (HTTP {status})" + (f": {msg}" if msg else ""))
+    return payload
+
+def list_accounts():
+    """GET /api/v3/brokerage/accounts — every account with its available
+    balance, as plain dicts. Read-only."""
+    payload = coinbase_request("GET", "/api/v3/brokerage/accounts")
+    out = []
+    for a in payload.get("accounts", []):
+        avail = (a.get("available_balance") or {}).get("value")
+        try:
+            avail = float(avail)
+        except Exception:
+            avail = 0.0
+        out.append({"currency": a.get("currency", ""), "name": a.get("name", ""),
+                    "available": avail})
+    return out
+
+_cb_cache = {"at": 0.0, "data": None}
+
+def coinbase_live_balances():
+    """Live balances through the wire, shaped like the snapshot holdings
+    (symbol/name/amount/usd_value/note) plus totals. Cached ~60 seconds —
+    the wire is read at most about once a minute. Dollar values come from
+    the app's normal live price feed; USD/USDC count $1 each. Raises
+    WireError on any problem — callers fall back to the snapshot."""
+    now = time.time()
+    if _cb_cache["data"] is not None and now - _cb_cache["at"] < 60:
+        return _cb_cache["data"]
+    accounts = list_accounts()
+    prices, _live = fetch_prices()
+    by = {p["symbol"]: p.get("price") for p in prices}
+    names = {sym: nm for _cid, sym, nm in COINS}
+    names.update({"USD": "US Dollar (cash)", "USDC": "USDC (cash)"})
+    rows, total, cash = [], 0.0, 0.0
+    for a in accounts:
+        amt = a["available"]
+        if amt <= 0:
+            continue
+        sym = a["currency"]
+        price = 1.0 if sym in ("USD", "USDC") else by.get(sym)
+        if price:
+            val = round(amt * price, 2)
+            total += val
+            note = "Live balance — read through the wire just now"
+        else:
+            val = None
+            note = "Live balance — no live price for it, so it is not counted in the total"
+        if sym in ("USD", "USDC"):
+            cash += amt
+            note = "Free cash — live from Coinbase"
+        rows.append({"symbol": sym, "name": names.get(sym, a["name"] or sym),
+                     "amount": amt, "usd_value": val, "note": note})
+    rows.sort(key=lambda r: (r["usd_value"] is None, -(r["usd_value"] or 0)))
+    data = {"rows": rows, "total": round(total, 2), "cash": round(cash, 2)}
+    _cb_cache.update(at=now, data=data)
+    return data
+
+def _trading_enabled():
+    return (os.environ.get("COINBASE_TRADING_ENABLED") or "").strip().lower() == "true"
+
+def market_order(side, product_id, usd_amount):
+    """One market order through the wire (market IOC, sized in dollars).
+    Returns {"order_id"}. Raises WireError if Coinbase refuses or the wire
+    is down. Trade endpoints ONLY — there is no withdrawal/transfer code
+    anywhere in this app."""
+    body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id,
+            "side": side.upper(),
+            "order_configuration": {"market_market_ioc": {"quote_size": f"{usd_amount:.2f}"}}}
+    resp = coinbase_request("POST", "/api/v3/brokerage/orders", body)
+    if not resp.get("success"):
+        er = resp.get("error_response") or {}
+        raise WireError("Coinbase did not take the order"
+                        + (f": {er.get('error_message')}" if er.get("error_message") else "."))
+    sr = resp.get("success_response") or {}
+    return {"order_id": resp.get("order_id") or sr.get("order_id") or ""}
+
+def record_flip(c, side, coin, amount_usd, qty, price, what, why, how, risk, exit_plan, result):
+    """The app's flip-recording path — the same INSERT the proposal
+    'I did this' button uses, so a wire flip lands in the books exactly
+    like a hand-done one."""
+    cur = c.execute(
+        "INSERT INTO flips(created_at, side, coin, amount_usd, qty, price, what, why, how, risk, exit_plan, result)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (datetime.datetime.now(datetime.timezone.utc).isoformat(), side, coin,
+         amount_usd, qty, price, what, why, how, risk, exit_plan, result))
+    c.commit()
+    return cur.lastrowid
+
+def _px(v):
+    return f"${v:,.0f}" if v >= 100 else (f"${v:,.2f}" if v >= 1 else f"${v:,.4f}")
+
+def _wire_flip_texts(side, sym, name, amount, price, chg, order_id):
+    """WHAT/WHY/HOW/RISK/EXIT for a wire flip, in the same Ladder words
+    suggest_move() uses."""
+    stop = round(price * 0.92, 2)
+    s10 = round(price * 1.10, 2)
+    s20 = round(price * 1.20, 2)
+    s40 = round(price * 1.40, 2)
+    if side == "buy":
+        what = (f"Bought ${amount:.2f} of {name} ({sym}) in Coinbase at about {_px(price)} per coin — "
+                "placed by COINFLIPPA through its direct Coinbase wire.")
+        why = (f"{sym} is on a dip: down {abs(chg):.1f}% in the last 24 hours, and the Ladder only buys "
+               "dips — it never chases a coin that's already running up green. First job of this flip: "
+               "get the buy money back. Then the rest rides as house money.")
+        how = (f"COINFLIPPA placed a market buy through its direct wire into Coinbase "
+               f"(order {order_id}). Your Coinbase cash moved into {sym}.")
+        risk = (f"Ratchet floor: the stop starts at −8% — if {sym} falls to about {_px(stop)}, sell and keep "
+                f"the loss small, no hoping. The floor only moves UP: once {sym} is up +10% (about {_px(s10)}), "
+                f"the stop moves up to your buy price ({_px(price)}, breakeven) — from then on this flip can't "
+                "end below where it started. The floor never moves down.")
+        exit_plan = (f"Seed back first, up the stairs: at {_px(s10)} (+10%) sell 1/4 — cash starts coming back "
+                     f"to the Pot. At {_px(s20)} (+20%) sell 1/4 more. At {_px(s40)} (+40%) sell 1/4 more. "
+                     "The last 1/4 rides as house money. ALL of any profit goes to the Vault, where it is "
+                     "saved and never risked again — only the seed money goes back to work.")
+    else:
+        what = (f"Sold ${amount:.2f} of {name} ({sym}) in Coinbase at about {_px(price)} per coin — "
+                "placed by COINFLIPPA through its direct Coinbase wire.")
+        why = ("A Ladder exit: selling a piece of the open position sends cash back to the Pot and locks "
+               "the move in. When the coin's flips fully close, ALL of any realized profit goes to the "
+               "Vault — saved, never risked again (KEN'S LAW).")
+        how = (f"COINFLIPPA placed a market sell through its direct wire into Coinbase "
+               f"(order {order_id}). The cash landed back in your Coinbase cash.")
+        risk = ("This piece of the position is closed — it can't ride any further up or down. Whatever "
+                "position is left keeps its ratchet floor: the floor only moves up, never down.")
+        exit_plan = ("Cash from this sale is back in the Pot. The Vault counts this coin's real profit "
+                     "when its flips net to zero coins left — and banks ALL of it.")
+    return what, why, how, risk, exit_plan
+
+def place_flip_order(side, product_id, usd_amount):
+    """Place one real flip through the wire — GATED. Returns
+    {"ok": True, "order_id", "flip_id"} or {"ok": False, "reason"}.
+
+    Every gate mirrors the engine's own rules (suggest_move / pot_state):
+    trading flag on, key saved, watchlist USD pairs only, dip-only buys off
+    the app's own price feed, the $10 fee floor — waived only in Penny Play
+    whole-stack mode: when the Pot's free cash is small enough that a 25%
+    Ladder piece would fall under the fee floor (cash < 4 × $10), the whole
+    working stack rides in one flip, like Flip #1 did. Sells are allowed
+    any time for a position the Pot actually holds (stairs/floor exits).
+    Nothing calls this automatically — it exists, tested and dormant,
+    behind the flag."""
+    def refuse(reason):
+        return {"ok": False, "reason": reason}
+    side = (side or "").strip().lower()
+    if side not in ("buy", "sell"):
+        return refuse("Side must be buy or sell.")
+    product_id = (product_id or "").strip().upper()
+    if product_id not in WATCHLIST_PRODUCTS:
+        return refuse(f"{product_id or 'That coin'} is not a watchlist USD pair — the wire only trades "
+                      "BTC, ETH, SOL, LINK, AVAX, XRP and DOGE against dollars.")
+    sym = product_id.split("-")[0]
+    name = {s: n for _c, s, n in COINS}[sym]
+    try:
+        amount = float(usd_amount)
+    except Exception:
+        return refuse("The amount must be a number of dollars.")
+    if amount <= 0:
+        return refuse("The amount must be over $0.")
+    if not _trading_enabled():
+        return refuse("Trading is switched OFF. COINBASE_TRADING_ENABLED is not 'true', so the wire "
+                      "will not place any order — it can only read.")
+    try:
+        _cb_load_key()
+    except WireError as e:
+        return refuse(str(e))
+    c = db()
+    try:
+        st = pot_state(c)
+        prices, _live = fetch_prices()
+        by = {p["symbol"]: p for p in prices}
+        row = by.get(sym) or {}
+        price = row.get("price")
+        if not price:
+            return refuse(f"Prices for {sym} are not loading right now, so no order gets placed.")
+        if side == "sell":
+            held = st["holdings"].get(sym, {"qty": 0.0})
+            held_val = held["qty"] * price
+            if held["qty"] <= 0.0000001 or held_val <= 0:
+                return refuse(f"The Pot holds no {sym} to sell.")
+            if amount > held_val + 0.01:
+                return refuse(f"That sell is bigger than the Pot's {sym} position (about ${held_val:,.2f}).")
+        else:
+            chg = row.get("change_24h")
+            if chg is None:
+                return refuse(f"COINFLIPPA can't see whether {sym} is up or down today, so no buy gets placed.")
+            if chg >= 0:
+                return refuse(f"No buy — {sym} is up {chg:+.1f}% today, and the Ladder only buys dips. "
+                              "It never chases a coin that's already running up green.")
+            cash = st["cash"]
+            if amount > cash + 0.001:
+                return refuse(f"The Pot only has ${cash:,.2f} free cash — that buy is too big.")
+            penny = cash < MIN_FLIP * 4  # Ladder quarters would fall under the fee floor
+            if amount < MIN_FLIP:
+                if not penny:
+                    return refuse(f"No flip under ${MIN_FLIP:.0f} — Coinbase fees would eat it.")
+                if amount < cash * 0.9:
+                    return refuse("Penny Play rides the whole working stack in one flip or not at all — "
+                                  f"a piece under ${MIN_FLIP:.0f} would be eaten by fees.")
+        order = market_order(side, product_id, amount)
+        qty = round(amount / price, 8)
+        what, why, how, risk, exit_plan = _wire_flip_texts(
+            side, sym, name, amount, price, row.get("change_24h"), order["order_id"])
+        fid = record_flip(c, side, sym, round(amount, 2), qty, price, what, why, how, risk,
+                          exit_plan,
+                          f"Filled through COINFLIPPA's direct Coinbase wire — order {order['order_id']}.")
+        return {"ok": True, "order_id": order["order_id"], "flip_id": fid}
+    except WireError as e:
+        return refuse(str(e))
+    finally:
+        c.close()
+
 # ---------------- html helpers ----------------
 def money(v):
     if v is None: return "—"
@@ -580,6 +923,11 @@ def page(title, body, welcome=False):
 def _startup():
     init_db()
 
+@app.get("/api/coinbase/status")
+def coinbase_status_route():
+    """Is the wire connected? Presence of the key only — never the key."""
+    return coinbase_status()
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -613,6 +961,40 @@ def dashboard(request: Request):
         f"<tr><td><b>{h['symbol']}</b><br><span class='mut'>{h['name']}</span></td>"
         f"<td class='num'>{h['amount']:,.8g}</td><td class='num'><b>{money(h['usd_value'])}</b></td>"
         f"<td class='small'>{h['note']}</td></tr>" for h in holds)
+    # Account card: the dated snapshot by default — byte-for-byte what this
+    # page has always shown. ONLY when a Coinbase key is saved does the wire
+    # get read: live balances (labeled Live) on success, snapshot + a plain
+    # failure note on any wire error.
+    snap_card = f"""<div class="card"><div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
+<img class="aport" src="/static/ken-tuxedo.webp" alt="Ken — founder of COINFLIPPA">
+<div style="flex:1;min-width:200px"><span>Real balances — read from your Coinbase</span>
+<b class="big">{money(snap['total_usd'])}</b>
+<span>Cash you can move: <b style="color:var(--txt)">{money(snap['cash_usd'])}</b> · The rest is staked ETH and dust coins (see the table below)</span>
+<div class="notebox warn" style="margin-bottom:0"><b>📸 This is a snapshot, not a live feed.</b>
+Last read from Coinbase: <b>{snap['taken_label']}</b>. COINFLIPPA does not have a live wire into
+Coinbase — when you want fresh numbers, Milli reads your account again and updates this card.
+Coin prices below ARE live.</div></div></div></div>"""
+    acct_rows = hold_rows
+    acct_card = snap_card
+    if coinbase_status()["connected"]:
+        try:
+            la = coinbase_live_balances()
+            acct_rows = "".join(
+                f"<tr><td><b>{h['symbol']}</b><br><span class='mut'>{h['name']}</span></td>"
+                f"<td class='num'>{h['amount']:,.8g}</td><td class='num'><b>{money(h['usd_value'])}</b></td>"
+                f"<td class='small'>{h['note']}</td></tr>" for h in la["rows"])
+            acct_card = f"""<div class="card"><div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
+<img class="aport" src="/static/ken-tuxedo.webp" alt="Ken — founder of COINFLIPPA">
+<div style="flex:1;min-width:200px"><span>Real balances — LIVE from your Coinbase</span>
+<b class="big">{money(la['total'])}</b>
+<span>Cash you can move: <b style="color:var(--txt)">{money(la['cash'])}</b> · Read through COINFLIPPA's direct wire (see the table below)</span>
+<div class="notebox" style="margin-bottom:0"><b>🟢 Live from Coinbase.</b>
+COINFLIPPA read your account just now through its direct wire — it refreshes about once a
+minute while a key is saved. Coin prices below ARE live too.</div></div></div></div>"""
+        except Exception:
+            acct_card = snap_card + """<div class="notebox warn">⚠️ <b>Live read failed — showing the last snapshot instead.</b>
+COINFLIPPA tried its direct Coinbase wire just now and could not read your account, so the
+card above is the last snapshot, not live numbers.</div>"""
     def price_disp(v):
         if not v: return "—"
         return money(v) if v >= 1 else f"${v:,.4f}"
@@ -663,16 +1045,8 @@ def dashboard(request: Request):
     body = f"""
 {('<div class="flash">' + flash + '</div>') if flash else ''}
 <h2>🏦 My Coinbase Account</h2>
-<div class="card"><div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
-<img class="aport" src="/static/ken-tuxedo.webp" alt="Ken — founder of COINFLIPPA">
-<div style="flex:1;min-width:200px"><span>Real balances — read from your Coinbase</span>
-<b class="big">{money(snap['total_usd'])}</b>
-<span>Cash you can move: <b style="color:var(--txt)">{money(snap['cash_usd'])}</b> · The rest is staked ETH and dust coins (see the table below)</span>
-<div class="notebox warn" style="margin-bottom:0"><b>📸 This is a snapshot, not a live feed.</b>
-Last read from Coinbase: <b>{snap['taken_label']}</b>. COINFLIPPA does not have a live wire into
-Coinbase — when you want fresh numbers, Milli reads your account again and updates this card.
-Coin prices below ARE live.</div></div></div></div>
-<table><tr><th>Coin</th><th class="num">How much</th><th class="num">Worth</th><th>Plain words</th></tr>{hold_rows}</table>
+{acct_card}
+<table><tr><th>Coin</th><th class="num">How much</th><th class="num">Worth</th><th>Plain words</th></tr>{acct_rows}</table>
 
 <h2>🎯 Today's Stance</h2>
 <div class="card"><b class="big" style="font-size:24px">{stance}</b><div class="small" style="margin-top:6px">{summary}</div>
