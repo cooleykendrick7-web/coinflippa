@@ -18,6 +18,22 @@ ENGINE RULES (in code, not just words):
     yet"). suggest_move() refuses below $10.
   - Stance comes from 30-day price changes: red market = "Small and patient".
   - No fake flips, no fake profit. Profit/loss counts only recorded flips.
+
+THE ALWAYS-UP LADDER (Ken's strategy, ordered 2026-11-08 — baked into
+suggest_move() and shown on the dashboard):
+  1. Seed back first — a flip's first job is recovering its buy amount; the
+     rest rides as house money.
+  2. Dip-only buys — only watchlist coins DOWN on the day (BTC first, then
+     ETH, then the rest). Never chase a coin already running up green.
+  3. Small pieces — about 25% of the Pot's free cash per flip, never all-in.
+  4. Staircase exits — sell 1/4 at +10%, 1/4 at +20%, 1/4 at +40%, last 1/4
+     rides.
+  5. Ratchet floor — stop starts at -8%; once the flip is up +10% the stop
+     moves UP to the buy price (breakeven). The floor only moves up.
+  6. Vault split — 20% of every realized profit is parked in the Vault and
+     never risked again (vault_state() counts only closed flips: a coin
+     whose flips net to ~zero coins left, sells vs buys).
+  7. One move at a time, explained in plain words before Ken acts.
 """
 import os, json, time, datetime, sqlite3, urllib.request, urllib.error
 from pathlib import Path
@@ -75,14 +91,30 @@ SEED_SUGGESTIONS = [
     ("stock", "KO", "Coca-Cola Co", "Sells drinks in every country and pays a dividend (a small cash payout to owners). Slow and steady, not a get-rich pick.", "Low"),
 ]
 
-SAFETY_RULES = [
-    "Never all-in — never put everything into one coin.",
-    "Always keep some cash back in the Pot.",
-    "Cut losses at the stop — if a flip drops to its stop price, sell. No hoping.",
-    "Take profit in pieces — sell a little at a time on the way up, not all at once.",
-    "No flip under $10 — Coinbase fees would eat it before it starts.",
-    "Nothing is promised. Crypto can drop fast. Only flip money you can afford to lose.",
+LADDER_RULES = [
+    "Get your seed back first. A flip's first job is to pay back the money you put in. "
+    "When the coin goes up, you sell pieces — that cash comes back to the Pot first, "
+    "and what's left rides as house money.",
+    "Only buy dips. COINFLIPPA only lines up a buy when a coin is DOWN that day — "
+    "Bitcoin first, then Ethereum, then the rest of the watchlist. If a coin is "
+    "already running up green, we do not chase it.",
+    "Small pieces only. Each flip uses about a quarter (25%) of the Pot's free cash — "
+    "never the whole Pot. And no flip under $10: Coinbase fees would eat it.",
+    "Climb the stairs out. Sell 1/4 at +10%, sell 1/4 at +20%, sell 1/4 at +40%. "
+    "The last 1/4 rides — that part is house money playing for free.",
+    "The floor only rises. Every flip starts with a floor at −8%: if the coin falls "
+    "there, sell and keep the loss small. Once the coin is up +10%, the floor moves "
+    "UP to your buy price — from then on, that flip can't end below where it started. "
+    "The floor never moves down.",
+    "Feed the Vault. 20% of every real profit goes into the Vault — money that is "
+    "never risked again. The Vault only grows.",
+    "One step at a time. One move lined up at a time, explained in plain words — "
+    "WHAT, WHY, HOW, RISK, EXIT — before you ever tap buy. No move is a fine move.",
 ]
+
+LADDER_HONEST_LINE = ("No strategy can promise the price never dips. The Ladder makes sure "
+                      "wins get locked in pieces and the floor keeps rising — that's how "
+                      "the pot climbs.")
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -255,9 +287,34 @@ def pot_value(c, prices):
 
 MIN_FLIP = 10.00
 
+def vault_state(c):
+    """The Vault = 20% of REALIZED profit, counted honestly from the flips
+    table. A flip counts as finished (closed) only when its coin's flips net
+    to ~zero coins left — then realized profit for that coin is sells minus
+    buys. Coins still being held contribute nothing yet (their profit isn't
+    real until sold). No closed flips = $0.00. Nothing invented."""
+    coins = {}
+    for f in c.execute("SELECT * FROM flips ORDER BY id"):
+        v = coins.setdefault(f["coin"], {"qty": 0.0, "buys": 0.0, "sells": 0.0})
+        if f["side"] == "buy":
+            v["qty"] += f["qty"] or 0; v["buys"] += f["amount_usd"] or 0
+        else:
+            v["qty"] -= f["qty"] or 0; v["sells"] += f["amount_usd"] or 0
+    realized = 0.0
+    closed = 0
+    for v in coins.values():
+        if v["sells"] > 0 and abs(v["qty"]) < 0.0000001:
+            realized += v["sells"] - v["buys"]
+            closed += 1
+    vault = round(0.20 * realized, 2) if realized > 0 else 0.0
+    return {"vault": vault, "realized_profit": round(realized, 2), "closed_flips": closed}
+
 def suggest_move(c, prices):
-    """Line up ONE real-move proposal, or refuse with a plain reason.
-    Rule: free pot cash under $10 = nothing to flip (fees would eat it)."""
+    """Line up ONE real-move proposal the Always-Up Ladder way, or refuse
+    with a plain reason. Gates, in order: fee gate (free pot cash < $10),
+    one waiting move at a time, prices must be loaded, and DIP-ONLY — the
+    first watchlist coin (BTC first, then ETH, then the rest) whose 24h
+    change is negative. A coin running up green is never chased."""
     st = pot_state(c)
     if st["cash"] < MIN_FLIP:
         return None, (f"Nothing to flip yet — the Pot has ${st['cash']:.2f} free cash and a flip under "
@@ -267,30 +324,62 @@ def suggest_move(c, prices):
     if waiting:
         return None, "A move is already lined up and waiting for Ken. One at a time."
     by = {p["symbol"]: p for p in prices}
-    btc = by.get("BTC")
-    if not btc or not btc["price"]:
+    if not any(p.get("price") for p in by.values()):
         return None, "Prices are not loading right now, so no move gets lined up. Try again in a few minutes."
+    pick = None
+    for _cid, sym, name in COINS:  # watchlist order: BTC first, then ETH, then the rest
+        p = by.get(sym)
+        if p and p.get("price") and p.get("change_24h") is not None and p["change_24h"] < 0:
+            pick = (sym, name, p)
+            break
+    if not pick:
+        return None, ("No move right now — every coin on the watchlist is up today, and the Ladder "
+                      "only buys dips. COINFLIPPA never chases a coin that's already running up. "
+                      "No move is a fine move — wait for a red day.")
+    sym, name, p = pick
+    price = p["price"]
+    chg = p["change_24h"]
+    # Small pieces: about 25% of free cash, never the whole Pot. The $10 fee
+    # floor still applies to the flip size itself.
     amount = round(max(MIN_FLIP, st["cash"] * 0.25), 2)
     amount = min(amount, st["cash"])
-    price = btc["price"]
-    stop = round(price * 0.92, 2)
-    target = round(price * 1.15, 2)
-    what = f"Buy ${amount:.2f} of Bitcoin (BTC) in Coinbase at about ${price:,.0f} per coin."
-    why = ("Bitcoin is the biggest, steadiest crypto. The market is down this month, so COINFLIPPA "
-           "starts small with the steadiest coin instead of chasing a wild one.")
-    how = ("In the Coinbase app: tap Buy, pick Bitcoin, type the dollar amount, review, confirm. "
+    stop = round(price * 0.92, 2)          # ratchet floor, step 0: −8%
+    s10 = round(price * 1.10, 2)           # staircase step 1 + ratchet trigger
+    s20 = round(price * 1.20, 2)           # staircase step 2
+    s40 = round(price * 1.40, 2)           # staircase step 3
+    def px(v):
+        return f"${v:,.0f}" if v >= 100 else (f"${v:,.2f}" if v >= 1 else f"${v:,.4f}")
+    what = (f"Buy ${amount:.2f} of {name} ({sym}) in Coinbase at about {px(price)} per coin. "
+            f"That's about a quarter of the Pot's free cash — a small piece, never the whole Pot.")
+    if sym == "BTC":
+        why_head = "Bitcoin is the biggest, steadiest crypto on the watchlist. "
+    elif sym == "ETH":
+        why_head = "Ethereum is the second-biggest crypto and powers a huge network of apps. "
+    else:
+        why_head = f"{name} is on the watchlist and it's the first one dipping today. "
+    why = (why_head +
+           f"And it's on a dip: {sym} is down {abs(chg):.1f}% in the last 24 hours. The Ladder "
+           "only buys dips — it never chases a coin that's already running up green. "
+           "First job of this flip: get the buy money back. Then the rest rides as house money.")
+    how = (f"In the Coinbase app: tap Buy, pick {name}, type ${amount:.2f}, review, confirm. "
            "Then come back here and tap 'I did this' so COINFLIPPA logs the flip.")
-    risk = ("Bitcoin can still drop. This is a small piece of the Pot (about a quarter of the free cash), "
-            "never everything.")
-    exit_plan = (f"Safety exit: if BTC falls to about ${stop:,.0f} (down 8%), sell and cut the loss. "
-                 f"Profit exit: if BTC climbs to about ${target:,.0f} (up 15%), sell a piece and keep the win.")
+    risk = (f"Ratchet floor: the stop starts at −8% — if {sym} falls to about {px(stop)}, sell and keep "
+            f"the loss small, no hoping. The floor only moves UP: once {sym} is up +10% (about {px(s10)}), "
+            f"the stop moves up to your buy price ({px(price)}, breakeven) — from then on this flip can't "
+            "end below where it started. The floor never moves down. And this is only about a quarter of "
+            "the Pot's free cash, so one bad flip can't sink the Pot.")
+    exit_plan = (f"Seed back first, up the stairs: at {px(s10)} (+10%) sell 1/4 — cash starts coming back "
+                 f"to the Pot. At {px(s20)} (+20%) sell 1/4 more. At {px(s40)} (+40%) sell 1/4 more — those "
+                 f"sold pieces are there to pay your ${amount:.2f} buy money back. The last 1/4 rides as "
+                 "house money — profit that stays in the game and can only add. Of any real profit at the "
+                 "end, 20% goes to the Vault and is never risked again.")
     cur = c.execute(
         "INSERT INTO proposals(created_at, title, coin, amount_usd, what, why, how, risk, exit_plan)"
         " VALUES(?,?,?,?,?,?,?,?,?)",
         (datetime.datetime.now(datetime.timezone.utc).isoformat(),
-         f"Buy ${amount:.2f} of BTC", "BTC", amount, what, why, how, risk, exit_plan))
+         f"Buy ${amount:.2f} of {sym}", sym, amount, what, why, how, risk, exit_plan))
     c.commit()
-    return cur.lastrowid, "Move lined up — see the Proposals section."
+    return cur.lastrowid, "Move lined up the Ladder way — see the Proposals section."
 
 # ---------------- html helpers ----------------
 def money(v):
@@ -423,6 +512,7 @@ def dashboard(request: Request):
     stance, summary = compute_stance(prices)
     record_daily_review(stance, summary)
     pv = pot_value(c, prices)
+    vs = vault_state(c)
     pot_rows = c.execute("SELECT * FROM pot_entries ORDER BY id DESC").fetchall()
     flips = c.execute("SELECT * FROM flips ORDER BY id DESC").fetchall()
     props = c.execute("SELECT * FROM proposals ORDER BY id DESC").fetchall()
@@ -471,7 +561,7 @@ def dashboard(request: Request):
                 f"<b>HOW</b><span>{p['how']}</span><b>RISK</b><span>{p['risk']}</span>"
                 f"<b>EXIT</b><span>{p['exit_plan']}</span></div>{actions}</div>")
     props_html = "".join(prop_html(p) for p in props) or \
-        "<div class='notebox'>No moves lined up right now. When the Pot has $10 or more of free cash, tap the gold button and COINFLIPPA will study the prices and line up one move here.</div>"
+        "<div class='notebox'>No moves lined up right now. When the Pot has $10 or more of free cash AND a watchlist coin is on a dip, tap the gold button — COINFLIPPA studies the prices and lines up one Ladder move here. If everything is running up green, it waits — the Ladder never chases.</div>"
 
     def sug_rows(rows):
         return "".join(
@@ -479,7 +569,7 @@ def dashboard(request: Request):
             f"<td class='small'>{s['reason']}</td>"
             f"<td><span class='badge risk-{s['risk_level']}'>{s['risk_level']} risk</span></td></tr>" for s in rows)
 
-    rules = "".join(f"<li style='margin:6px 0'>{r}</li>" for r in SAFETY_RULES)
+    rules = "".join(f"<li style='margin:6px 0'>{r}</li>" for r in LADDER_RULES)
     pnl_cls = "up" if pv["pnl"] >= 0 else "down"
 
     body = f"""
@@ -506,6 +596,7 @@ Coin prices below ARE live.</div></div></div></div>
 <div class="card"><span>Free cash ready</span><b class="big">{money(pv['cash'])}</b></div>
 <div class="card"><span>Pot worth now</span><b class="big">{money(pv['current_value'])}</b></div>
 <div class="card"><span>Profit / loss</span><b class="big {pnl_cls}">{money(pv['pnl'])} ({pv['pnl_pct']:+.2f}%)</b><span>Real flips only — no fake numbers</span></div>
+<div class="card"><span>🔒 The Vault</span><b class="big gold">{money(vs['vault'])}</b><span>20% of every real flip profit is parked here and never risked again. It fills when flips close for real — right now: {vs['closed_flips']} closed flip(s), {money(vs['realized_profit'])} real profit banked.</span></div>
 </div>
 <table><tr><th>Pot history</th><th class="num">Amount</th><th>Note</th></tr>{pot_hist}</table>
 <div class="card" style="margin-top:14px"><h3>Add or take out Pot money</h3>
@@ -532,8 +623,9 @@ Coin prices below ARE live.</div></div></div></div>
 <table><tr><th>Stock</th><th>Why people buy it</th><th>Risk</th></tr>{sug_rows(sug_s)}</table>
 <div class="notebox">Ideas are information, not orders. COINFLIPPA never buys a stock or coin on this page — you always make the real move in Coinbase yourself.</div>
 
-<h2>🛡️ Safety Rules (built into COINFLIPPA)</h2>
-<div class="card"><ul style="margin:0;padding-left:20px;font-size:15px">{rules}</ul></div>
+<h2>🪜 THE ALWAYS-UP LADDER — Ken's Strategy (built into COINFLIPPA)</h2>
+<div class="card"><ol style="margin:0;padding-left:22px;font-size:15px">{rules}</ol>
+<div class="notebox" style="margin-bottom:0;margin-top:12px">💬 The honest word: <b>{LADDER_HONEST_LINE}</b></div></div>
 """
     return page("Dashboard", body, welcome=True)
 
