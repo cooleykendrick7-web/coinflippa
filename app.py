@@ -30,9 +30,10 @@ suggest_move() and shown on the dashboard):
      rides.
   5. Ratchet floor — stop starts at -8%; once the flip is up +10% the stop
      moves UP to the buy price (breakeven). The floor only moves up.
-  6. Vault split — 20% of every realized profit is parked in the Vault and
-     never risked again (vault_state() counts only closed flips: a coin
-     whose flips net to ~zero coins left, sells vs buys).
+  6. KEN'S LAW — profit only: ALL of every realized profit is saved in the
+     Vault and never risked again (vault_state() counts only closed flips:
+     a coin whose flips net to ~zero coins left, sells vs buys). Only the
+     seed (buy) money goes back to work.
   7. One move at a time, explained in plain words before Ken acts.
 """
 import os, json, time, datetime, sqlite3, urllib.request, urllib.error
@@ -106,8 +107,9 @@ LADDER_RULES = [
     "there, sell and keep the loss small. Once the coin is up +10%, the floor moves "
     "UP to your buy price — from then on, that flip can't end below where it started. "
     "The floor never moves down.",
-    "Feed the Vault. 20% of every real profit goes into the Vault — money that is "
-    "never risked again. The Vault only grows.",
+    "Feed the Vault — ALL of it. Every dollar of real profit goes into the Vault "
+    "and is saved — never risked again. Only the seed money goes back to work. "
+    "The Vault only grows.",
     "One step at a time. One move lined up at a time, explained in plain words — "
     "WHAT, WHY, HOW, RISK, EXIT — before you ever tap buy. No move is a fine move.",
 ]
@@ -288,7 +290,8 @@ def pot_value(c, prices):
 MIN_FLIP = 10.00
 
 def vault_state(c):
-    """The Vault = 20% of REALIZED profit, counted honestly from the flips
+    """The Vault = 100% of REALIZED profit (Ken's profit-only law: ALL profit
+    is saved, never risked again), counted honestly from the flips
     table. A flip counts as finished (closed) only when its coin's flips net
     to ~zero coins left — then realized profit for that coin is sells minus
     buys. Coins still being held contribute nothing yet (their profit isn't
@@ -306,7 +309,7 @@ def vault_state(c):
         if v["sells"] > 0 and abs(v["qty"]) < 0.0000001:
             realized += v["sells"] - v["buys"]
             closed += 1
-    vault = round(0.20 * realized, 2) if realized > 0 else 0.0
+    vault = round(realized, 2) if realized > 0 else 0.0
     return {"vault": vault, "realized_profit": round(realized, 2), "closed_flips": closed}
 
 def suggest_move(c, prices):
@@ -372,7 +375,8 @@ def suggest_move(c, prices):
                  f"to the Pot. At {px(s20)} (+20%) sell 1/4 more. At {px(s40)} (+40%) sell 1/4 more — those "
                  f"sold pieces are there to pay your ${amount:.2f} buy money back. The last 1/4 rides as "
                  "house money — profit that stays in the game and can only add. Of any real profit at the "
-                 "end, 20% goes to the Vault and is never risked again.")
+                 "end, ALL of the profit goes to the Vault, is saved, and is never risked "
+                 "again — only the seed money goes back to work.")
     cur = c.execute(
         "INSERT INTO proposals(created_at, title, coin, amount_usd, what, why, how, risk, exit_plan)"
         " VALUES(?,?,?,?,?,?,?,?,?)",
@@ -596,7 +600,7 @@ Coin prices below ARE live.</div></div></div></div>
 <div class="card"><span>Free cash ready</span><b class="big">{money(pv['cash'])}</b></div>
 <div class="card"><span>Pot worth now</span><b class="big">{money(pv['current_value'])}</b></div>
 <div class="card"><span>Profit / loss</span><b class="big {pnl_cls}">{money(pv['pnl'])} ({pv['pnl_pct']:+.2f}%)</b><span>Real flips only — no fake numbers</span></div>
-<div class="card"><span>🔒 The Vault</span><b class="big gold">{money(vs['vault'])}</b><span>20% of every real flip profit is parked here and never risked again. It fills when flips close for real — right now: {vs['closed_flips']} closed flip(s), {money(vs['realized_profit'])} real profit banked.</span></div>
+<div class="card"><span>🔒 The Vault</span><b class="big gold">{money(vs['vault'])}</b><span>ALL profit from real flips is saved here and never risked again — profit only, only the seed money goes back to work. It fills when flips close for real — right now: {vs['closed_flips']} closed flip(s), {money(vs['realized_profit'])} real profit banked.</span></div>
 </div>
 <table><tr><th>Pot history</th><th class="num">Amount</th><th>Note</th></tr>{pot_hist}</table>
 <div class="card" style="margin-top:14px"><h3>Add or take out Pot money</h3>
@@ -625,6 +629,7 @@ Coin prices below ARE live.</div></div></div></div>
 
 <h2>🪜 THE ALWAYS-UP LADDER — Ken's Strategy (built into COINFLIPPA)</h2>
 <div class="card"><ol style="margin:0;padding-left:22px;font-size:15px">{rules}</ol>
+<div class="notebox" style="margin-bottom:0;margin-top:12px"><b class="gold">⚖️ KEN'S LAW: Profit only. Every dollar of profit is saved in the Vault and never risked again. Only the seed money goes back to work.</b></div>
 <div class="notebox" style="margin-bottom:0;margin-top:12px">💬 The honest word: <b>{LADDER_HONEST_LINE}</b></div></div>
 """
     return page("Dashboard", body, welcome=True)
