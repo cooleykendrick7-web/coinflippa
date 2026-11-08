@@ -171,7 +171,91 @@ def init_db():
         c.executemany(
             "INSERT INTO suggestions(kind, symbol, name, reason, risk_level) VALUES(?,?,?,?,?)",
             SEED_SUGGESTIONS)
+    migrate_flip1(c)
     c.commit(); c.close()
+
+# ---------------- one-time sync: Flip #1 (Nov 8, 2026) ----------------
+# Flip #1 really happened in Ken's Coinbase on Sun Nov 8, 2026, 2:49 PM CT
+# and was recorded in the sidebar dashboard the same day — but this app's
+# books were never updated (empty flips, $0.98-only pot, Nov 7 snapshot).
+# This guarded migration brings the app to the verified Nov 8 reality:
+# Ken's app screenshots, a read-only Coinbase web read at 2:50 PM CT, and
+# the dashboard record all agree to the penny. GUARDS: it runs only while
+# the flips table is empty, and each piece also checks it is not already
+# there — so it can never duplicate on restart and never touches other rows.
+FLIP1_POT_NOTE = ("Flip #1 stake — Ken's Ethereum converted to Solana in Coinbase "
+                  "(Penny Play), filled Nov 8, 2026, 2:49 PM CT")
+FLIP1_SNAPSHOT_LABEL = "Sun Nov 8, 2026, 2:50 PM CT"
+FLIP1_HOLDINGS = [
+    ("SOL", "Solana", 0.10176121, 9.07, "Flip #1's position — free, 0% staked, ready to sell up the stairs"),
+    ("USD", "US Dollar (cash)", 0.87, 0.87, "Free cash — this is in the Pot"),
+    ("USDC", "USDC (cash)", 0.11, 0.11, "Free cash — this is in the Pot"),
+    ("ETH", "Ethereum", 0, 0.00, "Fully converted into Solana for Flip #1 — nothing left"),
+    ("SARP", "Strategic American Protocol", 898.65423558, 0.02, "Dust — tiny amount, worth about 2 cents"),
+    ("POL", "Polygon Ecosystem Token", 0.27668373, 0.02, "100% staked. Dust — worth about 2 cents"),
+    ("AERGO", "Aergo", 0.08711746, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("LINK", "Chainlink", 0.00012552, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("FET", "Artificial Superintelligence Alliance", 0.00385081, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("ETC", "Ethereum Classic", 0.00004592, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("GST", "Green Satoshi Token", 0.10467966, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("TVK", "Virtua", 0.03216152, 0.00, "Dust — shows as $0.00 on Coinbase"),
+    ("FOX", "Shapeshift FOX Token", 0.00143164, 0.00, "Dust — shows as $0.00 on Coinbase"),
+]
+
+def migrate_flip1(c):
+    """One-time, guarded: log Flip #1, its $9.07 Pot stake, and the Nov 8
+    account snapshot. No-op once any flip exists. The Pot's SOL holding
+    needs no row of its own — pot_state() derives holdings from flips."""
+    if c.execute("SELECT COUNT(*) n FROM flips").fetchone()["n"]:
+        return
+    if not c.execute("SELECT COUNT(*) n FROM pot_entries WHERE note=?",
+                     (FLIP1_POT_NOTE,)).fetchone()["n"]:
+        c.execute(
+            "INSERT INTO pot_entries(kind, amount, note, created_at) VALUES('in', 9.07, ?, ?)",
+            (FLIP1_POT_NOTE, "2026-11-08T14:49:00-06:00"))
+    what = ("Bought $9.07 of Solana (SOL) in Coinbase at $89.1302 per coin — that's "
+            "0.10176121 SOL. This was a Penny Play whole-stack flip, not a 25% Ladder "
+            "piece: Ken's full free Ethereum was converted straight into Solana in one move.")
+    why = ("Penny Play: with a pot this small, splitting the buy into Ladder quarters would "
+           "let Coinbase fees eat it, so the whole working stack rode in one flip. Ken's full "
+           "free Ethereum (0.00420004 ETH) was converted to Solana in Coinbase — filled Sun "
+           "Nov 8, 2026, 2:49 PM CT at about $89.13 per coin. Solana was the deepest dip on "
+           "the watchlist, down hard on the month, so it had the most bounce room. The plan "
+           "from here: sell 1/3 at $98.04 (+10%), sell 1/3 at $106.95 (+20%), and let the "
+           "last 1/3 ride as house money.")
+    how = ("In Coinbase: Convert — Ethereum to Solana, the full free amount (0.00420004 ETH), "
+           "with the Earn/stake toggle OFF so the Solana landed free, not staked. It filled "
+           "for a total of $9.07, and 0.10176121 SOL landed in the account. In the Pot, cash "
+           "went from $10.05 to $0.98 and the Pot now holds the Solana.")
+    risk = ("Ratchet floor: the stop starts at $82.00 — that's −8% under the $89.13 buy price. "
+            "If Solana falls there, sell it all and keep the loss small, no hoping. The floor "
+            "only moves UP: once Solana is up +10% (about $98.04), the stop moves up to the "
+            "buy price ($89.13, breakeven) — from then on this flip can't end below where it "
+            "started. The floor never moves down.")
+    exit_plan = ("Seed back first, up the stairs: at $98.04 (+10%) sell 1/3 — cash starts coming "
+                 "back to the Pot. At $106.95 (+20%) sell 1/3 more. The last 1/3 rides as house "
+                 "money for as long as it keeps climbing. ALL of any profit goes to the Vault, "
+                 "where it is saved and never risked again — only the seed money goes back to work.")
+    c.execute(
+        "INSERT INTO flips(created_at, side, coin, amount_usd, qty, price,"
+        " what, why, how, risk, exit_plan, result) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("2026-11-08T14:49:00-06:00", "buy", "SOL", 9.07, 0.10176121, 89.1302,
+         what, why, how, risk, exit_plan,
+         "Filled in Coinbase Sun Nov 8, 2026, 2:49 PM CT — logged here so the books match."))
+    if not c.execute("SELECT COUNT(*) n FROM account_snapshots WHERE taken_label=?",
+                     (FLIP1_SNAPSHOT_LABEL,)).fetchone()["n"]:
+        cur = c.execute(
+            "INSERT INTO account_snapshots(taken_label, taken_at, total_usd, cash_usd, note)"
+            " VALUES(?,?,?,?,?)",
+            (FLIP1_SNAPSHOT_LABEL, "2026-11-08T14:50:00-06:00", 10.12, 0.98,
+             "Read read-only from Ken's Coinbase in the browser one minute after Flip #1 "
+             "filled; Ken's own app screenshots match to the penny. Ethereum is gone — fully "
+             "converted into Solana for Flip #1. This is a dated snapshot — COINFLIPPA does "
+             "not have a live Coinbase feed."))
+        sid = cur.lastrowid
+        c.executemany(
+            "INSERT INTO holdings(snapshot_id, symbol, name, amount, usd_value, note) VALUES(?,?,?,?,?,?)",
+            [(sid, s, n, a, v, note) for (s, n, a, v, note) in FLIP1_HOLDINGS])
 
 # ---------------- prices (CoinGecko, public, no key) ----------------
 _price_cache = {"at": 0.0, "rows": []}
